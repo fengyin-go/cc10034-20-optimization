@@ -92,6 +92,16 @@ class PipelineBus:
         self.routing_table: list[dict[str, Any]] = []
         # 过滤规则 — event_filter 核心配置
         self.filter_rules: list[dict[str, Any]] = []
+        # 格式适配规则版本注册表：rule_name -> 不可变版本快照列表
+        self.adapter_rule_versions: dict[str, list[dict[str, Any]]] = {}
+        # 各规则当前启用版本号
+        self.active_adapter_version: dict[str, int] = {}
+        # 事务 -> (规则名, 版本号)：首条事件到达时绑定，整笔事务固定同一版规则
+        self.tx_rule_bindings: dict[str, tuple[str, int]] = {}
+        # 已下发源坐标：同源坐标重复提交不再放行
+        self.dispatched_coordinates: set[str] = set()
+        # 已下发事务档案：支持按原规则回查与整笔重放
+        self.dispatched_transactions: dict[str, dict[str, Any]] = {}
         # 快照比对结果
         self.compare_results: list[dict[str, Any]] = []
         # 审计日志
@@ -199,6 +209,111 @@ class PipelineBus:
                 return True  # 重复
         buffer.append({"event_id": event_id, "ts": now})
         return False
+
+    # ---- 格式适配规则版本 / 事务绑定 / 去重 / 重放 ----
+
+    def register_adapter_rule(self, config: dict[str, Any]) -> dict[str, Any]:
+        """登记一版不可变的格式适配规则快照并返回版本号。
+
+        规则一旦登记即不可变；版本交接通过登记新版本并切换启用版本完成，
+        已绑定旧版本的事务继续使用旧版本，保证重放结果稳定。
+        """
+        rule_name = config.get("规则名称", "default")
+        versions = self.adapter_rule_versions.setdefault(rule_name, [])
+        snapshot = {
+            "rule_name": rule_name,
+            "version": len(versions) + 1,
+            "config": dict(config),
+            "registered_at": datetime.now().isoformat(),
+        }
+        versions.append(snapshot)
+        self.active_adapter_version[rule_name] = snapshot["version"]
+        return snapshot
+
+    def get_active_adapter_rule(self, rule_name: str) -> dict[str, Any] | None:
+        """获取规则当前启用版本的不可变快照。"""
+        version_no = self.active_adapter_version.get(rule_name)
+        if version_no is None:
+            return None
+        versions = self.adapter_rule_versions.get(rule_name, [])
+        for snap in versions:
+            if snap["version"] == version_no:
+                return snap
+        return None
+
+    def get_adapter_rule(self, rule_name: str, version_no: int) -> dict[str, Any] | None:
+        """按版本号回查某版规则快照（重放时使用）。"""
+        for snap in self.adapter_rule_versions.get(rule_name, []):
+            if snap["version"] == version_no:
+                return snap
+        return None
+
+    def bind_transaction_rule(self, tx_id: str, rule_name: str) -> dict[str, Any]:
+        """事务首条事件到达时绑定规则版本；同一事务后续事件沿用同一版。
+
+        返回 (规则名, 版本号, 快照, 是否首次绑定)。
+        """
+        existing = self.tx_rule_bindings.get(tx_id)
+        if existing is not None:
+            bound_name, bound_version = existing
+            snapshot = self.get_adapter_rule(bound_name, bound_version)
+            return {
+                "rule_name": bound_name,
+                "version": bound_version,
+                "snapshot": snapshot,
+                "first_bind": False,
+            }
+        snapshot = self.get_active_adapter_rule(rule_name)
+        if snapshot is None:
+            raise ValueError(f"规则 {rule_name} 尚未登记任何版本，无法绑定事务 {tx_id}")
+        self.tx_rule_bindings[tx_id] = (rule_name, snapshot["version"])
+        return {
+            "rule_name": rule_name,
+            "version": snapshot["version"],
+            "snapshot": snapshot,
+            "first_bind": True,
+        }
+
+    def get_transaction_rule(self, tx_id: str) -> tuple[str, int] | None:
+        """回查事务绑定的规则与版本。"""
+        return self.tx_rule_bindings.get(tx_id)
+
+    @staticmethod
+    def source_coordinate(event: dict[str, Any]) -> str:
+        """计算源端坐标：优先 binlog 文件+位点，退化到事件ID。"""
+        binlog_file = event.get("binlog_file")
+        binlog_pos = event.get("binlog_pos")
+        if binlog_file is not None and binlog_pos is not None:
+            return f"{binlog_file}:{binlog_pos}"
+        return str(event.get("事件ID", ""))
+
+    def is_coordinate_dispatched(self, coordinate: str) -> bool:
+        return coordinate in self.dispatched_coordinates
+
+    def mark_coordinate_dispatched(self, coordinate: str) -> None:
+        self.dispatched_coordinates.add(coordinate)
+
+    def commit_transaction(self, tx_id: str, records: list[dict[str, Any]],
+                           rule_name: str, rule_version: int) -> dict[str, Any]:
+        """提交事务档案：保存原始事件与绑定的规则版本，供回查与整笔重放。"""
+        bundle = {
+            "tx_id": tx_id,
+            "rule_name": rule_name,
+            "rule_version": rule_version,
+            "committed_at": datetime.now().isoformat(),
+            "records": list(records),
+            "coordinates": [self.source_coordinate(r) for r in records],
+        }
+        self.dispatched_transactions[tx_id] = bundle
+        return bundle
+
+    def get_dispatched_transaction(self, tx_id: str) -> dict[str, Any] | None:
+        """按事务ID回查已下发档案（按原规则版本）。"""
+        return self.dispatched_transactions.get(tx_id)
+
+    def reset_runtime(self) -> None:
+        """重置全部运行时态（测试与重新演练使用，不动示例数据 store）。"""
+        self.__init__()
 
     def evaluate_filter(self, event: ChangeEventRecord) -> tuple[bool, list[str]]:
         """评估过滤规则，返回 (是否通过, 匹配规则列表)。"""
